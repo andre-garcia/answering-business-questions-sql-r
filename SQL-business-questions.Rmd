@@ -1,0 +1,565 @@
+---
+title: "Answering business questions using SQL and R"
+author: "André Garcia"
+output:
+  html_document:
+    code_folding: "show"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+<br>
+
+### Introduction
+
+<br>
+
+The goal of this project is to use SQL and R to answer business questions and do some data analysis. We'll be using a modified version of a database called **Chinook**, provided by Dataquest. This database contains information about a fictional digital music shop, its customers, employees, sales, etc. The information is contained in eleven tables, which can be visualized in the schema diagram below. 
+
+
+![Image](chinook-schema.svg)
+This is an expansion of a guided project from the Data Analyst in R career path in Dataquest. More information about the database can be found on its website at https://github.com/lerocha/chinook-database 
+
+<br>
+
+### Helper functions
+
+<br>
+
+Let's start by creating a helper function that allows us to connect to the database, run SQL queries, disconnect and get the resulting output.  
+
+```{r}
+# loading required libraries
+
+library(DBI) 
+library(RSQLite)
+library(knitr) # kable wrapper function makes tables look nicer
+```
+
+```{r}
+# run_query helper function
+
+run_query <- function(query) {
+  conn <- dbConnect(SQLite(), 'chinook.db')
+  result <- dbGetQuery(conn, query)
+  dbDisconnect(conn)
+  return(result)
+}
+```
+
+
+Now let's check if our function works by running a sample query. 
+
+
+```{r}
+kable(run_query('SELECT * FROM customer LIMIT 10;'))
+```
+
+
+Looks good! The next step is creating a function that simply displays all tables in the database, using our previous helper function to run the necessary query.  
+
+```{r}
+# show_tables helper function
+
+show_tables <- function() {
+  q = "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')"
+  return(run_query(q))
+}
+```
+
+Let's run it to see if it's working. 
+
+```{r}
+kable(show_tables())
+```
+
+Perfect! We can move on to dealing with the business questions now. 
+
+<br>
+
+### Choosing new albums to be added to the store
+
+<br>
+
+The Chinook record store has just signed a deal with a new record label, and we're in charge of choosing the first three albums to be added to the store. There are four albums to choose from, and all four are by artists who don't have any tracks in the store right now. Below is the list of artist names and the genre of music they produce:
+
+
+
+Artist Name         	| Genre
+----------------------|--------
+Regal	                | Hip-Hop
+Red Tone	            | Punk
+Meteor and the Girls	| Pop
+Slim Jim Bites        | Blues
+
+
+The record label specializes in artists from the USA, and they have given Chinook some money to advertise the new albums in the USA. To aid in selecting albums, we're interested in finding out which genres sell the best in the USA. In order to do that, we are going to write a query that returns each genre, with the number of tracks sold in the USA, both in absolute numbers and in percentages. We'll store the result in a variable so that we can better inspect the data and visualize it. 
+
+
+```{r}
+q <- "
+  WITH tracks_sold_usa AS
+    (
+     SELECT
+       g.name genre_name,
+       SUM(il.quantity) tracks_sold
+     FROM invoice i
+     INNER JOIN invoice_line il ON i.invoice_id = il.invoice_id
+     INNER JOIN track t ON il.track_id = t.track_id
+     INNER JOIN genre g ON t.genre_id = g.genre_id
+     WHERE billing_country = 'USA'
+     GROUP BY 1
+     ORDER BY 2 DESC
+    )
+  SELECT
+    genre_name,
+    tracks_sold,
+    CAST(tracks_sold AS FLOAT) /
+      (
+       SELECT
+         SUM(il.quantity)
+       FROM invoice_line il
+       INNER JOIN invoice i ON il.invoice_id = i.invoice_Id
+       WHERE billing_country = 'USA'
+      ) * 100 pct
+  FROM tracks_sold_usa
+  ORDER BY 2 DESC
+"
+
+genre_df <- run_query(q)
+```
+
+Let's have a look at the resulting dataframe and then create a couple of plots to better show the data.    
+
+```{r}
+kable(genre_df)
+```
+
+```{r}
+library(ggplot2)
+```
+
+```{r}
+ggplot(genre_df, aes(x = reorder(genre_name, -tracks_sold), y = tracks_sold, fill=genre_name)) +
+  geom_col() +
+  labs(title = 'Tracks sold in the USA by genre',
+       x = 'genre name',
+       y = 'tracks sold') +
+  theme(axis.text.x = element_text(angle = 90)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.position = 'none')
+```
+
+```{r}
+library(treemap)
+
+treemap(genre_df,
+        index="genre_name",
+        vSize="pct",
+        type="index",
+        title="Sales per genre in the USA as a percentage",
+        palette="Dark2",
+        border.col=c("black"),             
+        border.lwds=1,                         
+        fontsize.labels=0.5,
+        fontcolor.labels="white",
+        fontface.labels=1,            
+        bg.labels="transparent",              
+        align.labels=c("left", "top"),                                  
+        overlap.labels=0.5,
+        inflate.labels=T)  
+
+```
+
+
+After looking at the data, we recommend adding the albums from the following 3 artists to the online store: 
+
+- "Red Tone" - Alternative & Punk genre accounts for 12.37% of our sales in the USA. 
+- "Slim Jim Bites" - Blues is responsible for 3.43%.
+- "Meteor and the Girls" - Pop music represents 2.1% of our USA sales. 
+ 
+Moreover, we encourage Chinook's management to look for more Rock artists, since the sales of this genre in the USA represent 53.38% of the total.
+
+<br>
+
+### Evaluating sales support agents' performance
+
+<br>
+
+The next issue we are going to address is sales support agents' performance. Each customer for the Chinook store gets assigned to a sales support agent within the company when they first make a purchase. We have been asked to analyze the purchases of customers belonging to each employee to see if any sales support agent is performing either better or worse than the others.
+
+Let's start by writing a query that finds the total dollar amount of sales assigned to each agent and then plot the results.
+
+```{r}
+q <- "
+  WITH sales_per_employee AS
+  (
+    SELECT
+      SUM(i.total) total_sales,
+      e.employee_id
+    FROM invoice i
+    INNER JOIN customer c ON i.customer_id = c.customer_id
+    INNER JOIN employee e ON c.support_rep_id = e.employee_id
+    GROUP BY 2
+  )
+  
+  SELECT
+    e.employee_id,
+    e.first_name || ' ' || e.last_name employee_name,
+    spc.total_sales,
+    e.hire_date,
+    e.birthdate
+  FROM sales_per_employee spc
+  INNER JOIN employee e ON e.employee_id = spc.employee_id
+  ORDER BY 3 DESC
+"
+
+sales_agents <- run_query(q) 
+```
+```{r}
+kable(sales_agents)
+```
+```{r}
+
+ggplot(sales_agents, (aes(x = employee_name, y = total_sales, fill = employee_name))) +
+geom_col() +
+labs(title = 'Sales by employee',
+     x = '',
+     y = "total sales") +
+theme(plot.title = element_text(hjust = 0.5)) +
+theme(legend.position = 'none')
+
+```
+
+From the data, we can see that, although Jane Peacock has sold more than the other employees, she has also been in the company longest, so that difference could possibly be due to the fact that she has been working for longer. 
+
+Let's calculate a monthly average per agent to see if we get a more precise picture. 
+
+Before we proceed, since this is a fictional database, we need to do a little hack and check what is the latest day for which we have data. We can consider that date to be "today" in our exercise and then use it to make our calculations. 
+
+```{r}
+# importing lubridate library to deal with dates
+
+library(lubridate)
+```
+
+```{r}
+q <-"
+SELECT
+  invoice_date,
+  COUNT(*)
+FROM invoice
+GROUP BY 1
+ORDER BY 1 DESC
+LIMIT 1;
+"
+results <- run_query(q)
+```
+```{r}
+today <- ymd(ymd_hms(results$invoice_date))
+```
+```{r}
+today
+```
+
+Now that we know that "today", or the last day for which we have sales data is 2020/12/30, we can use that together with the hire dates and total sales from the agents to better measure their performance.  
+
+```{r}
+# importing dplyr for dataframe manipulation 
+
+library(dplyr)
+```
+```{r}
+sales_agents <- sales_agents %>%
+  mutate(days_since_hire = as.numeric(today - ymd(ymd_hms(hire_date)))) %>%
+  mutate(sales_per_day = total_sales/days_since_hire,
+         sales_per_month = sales_per_day * 30)
+```
+
+```{r}
+sales_agents %>%
+  select(employee_name, sales_per_day, sales_per_month) %>%
+  kable()
+```
+
+
+
+```{r}
+ggplot(sales_agents, (aes(x=employee_name, y=sales_per_month, fill=employee_name))) +
+  geom_col() +
+  labs(title = 'Average sales per month by employee',
+       x = '',
+       y = "average sales per month") +
+theme(plot.title = element_text(hjust = 0.5)) +
+theme(legend.position = 'none')
+```
+
+After calculating sales by monthly average by employee, we can see that Jane Peacock does seem to have a slightly better performance than the other two sales agents, although the difference is not really significant (just around 2$). Moreover, there is almost no difference between the performance of the other two employees. 
+
+<br>
+
+### Breaking down data by country
+
+<br>
+
+Our next task is analyze sales data for customers from each different country. 
+
+We are asked to provide the following information from each country: 
+
+- total number of customers
+- total value of sales
+- average value of sales per customer
+- average order value
+
+Where a country has only one customer, we should collect them into an "Other" group.
+
+The results should be sorted by the total sales from highest to lowest, with the "Other" group at the very bottom.
+
+Finally, we are asked to present that data in plots and to use it to find a country with potential for growth. 
+
+Let's run a SQL query to retrieve the data and have a look at it. 
+
+```{r}
+q <- "
+
+WITH 
+
+  country_or_other AS
+  (
+   SELECT
+     CASE 
+       WHEN (
+             SELECT COUNT(*)
+             FROM customer
+             WHERE country = c.country
+             ) = 1 THEN 'Other'
+       ELSE c.country
+     END AS country,
+     i.*
+   FROM invoice i
+   INNER JOIN customer c ON c.customer_id = i.customer_id
+   
+  ),
+
+  customer_by_country AS
+  (
+   SELECT
+     c.country,
+     COUNT(DISTINCT(c.customer_id)) n_customers,
+     SUM(c.total) total_sales,
+     CAST(SUM(c.total) AS FLOAT) / COUNT(DISTINCT(c.customer_id)) avg_sales_per_customer,
+     AVG(c.total) avg_order_value
+  FROM country_or_other c
+  GROUP BY 1
+  ),
+  
+  sorted_other AS
+  (
+   SELECT
+     c.*,
+     CASE
+       WHEN c.country = 'Other' THEN 1
+       ELSE 0
+     END AS sort
+   FROM customer_by_country c 
+  )
+  
+SELECT
+  country,
+  n_customers,
+  total_sales,
+  avg_sales_per_customer,
+  avg_order_value
+FROM sorted_other
+ORDER BY sort, total_sales DESC
+  
+"
+data_by_country <- run_query(q)
+```
+
+```{r}
+kable(data_by_country)
+```
+
+Let's create some plots to better visualize the data. We are going to exclude the countries from the "Other" group for this analysis. 
+
+```{r}
+data_by_country <- data_by_country %>%
+  filter(country != 'Other')
+
+```
+
+
+```{r}
+data_by_country %>%
+  ggplot((aes(x = reorder(country, -total_sales), y = total_sales, fill = country))) +
+  geom_col() +
+  labs(title = 'Total sales by country',
+       x = '',
+       y = "total sales") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(legend.position = 'none')
+```
+
+```{r}
+data_by_country %>%
+  ggplot((aes(x = reorder(country, -avg_sales_per_customer), y = avg_sales_per_customer, fill = country))) +
+    geom_col() +
+    labs(title = 'Average sales per customer in each country',
+         x = '',
+         y = "average sales per customer") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    theme(legend.position = 'none')
+```
+
+```{r}
+data_by_country %>%
+  ggplot((aes(x = reorder(country, -avg_order_value), y = avg_order_value, fill = country))) +
+    geom_col() +
+    labs(title = 'Average order value by country',
+         x = '',
+         y = "average order value") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    theme(legend.position = 'none')
+```
+
+
+
+```{r}
+
+data_by_country %>%
+  ggplot((aes(x = reorder(country, -n_customers), y = n_customers, color = country))) +
+    geom_point(stat = "identity") +
+    labs(title = 'Number of customers by country',
+         x = '',
+         y = "number of customers") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    theme(legend.position = 'none')
+
+```
+
+```{r}
+data_by_country %>%
+  ggplot((aes(x = reorder(country, -avg_sales_per_customer), y = avg_sales_per_customer, fill = country))) +
+    geom_col() +
+    labs(title = 'Average sales per customer by country',
+         x = '',
+         y = "average sales per customer") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    theme(legend.position = 'none')
+
+```
+
+After quickly analyzing the data, we can see that Czech Republic's market seems to have potential to grow. We only have a couple of customers from there, but this country has an average sales per customer value significantly higher than the others, which suggests this market is definitely worth looking into more closely. 
+
+<br>
+
+### Whole album sales X individual tracks sales
+
+<br>
+
+The Chinook store is set up in a way that allows customers to make purchases in one of two ways:
+
+- Purchase a whole album
+- Purchase a collection of one or more individual tracks
+
+The store does not let customers purchase a whole album, and then add individual tracks to that same purchase (unless they do that by choosing each track manually). When customers purchase albums, they are charged the same price as if they had purchased each of those tracks separately.
+
+Management are currently considering changing their purchasing strategy to save money. The strategy they are considering is to purchase only the most popular tracks from each album from record companies, instead of purchasing every track from an album.
+
+We have been asked to find out what percentage of purchases are individual tracks versus whole albums. Management can use this data to understand the effect this decision might have on overall revenue.
+
+In order to satisfy this request, we need to classify each sale as a full album sale or individual tracks sale; calculate percentages; and finally come up with a conclusion about whether we should pursue this proposal from management or not. 
+
+```{r}
+
+q <- "
+WITH album_or_single AS
+  (
+
+   SELECT
+     DISTINCT(il.invoice_id),
+     CASE
+       WHEN
+         (
+         
+          (
+          SELECT
+            t.track_id
+          FROM track t
+          WHERE album_id = ( 
+                            SELECT
+                              t2.album_id
+                            FROM track t2
+                            INNER JOIN invoice_line il2 ON t2.track_id = il2.track_id
+                            WHERE il2.invoice_id = il.invoice_id
+                            LIMIT 1
+                            )
+          EXCEPT
+        
+          SELECT
+            t3.track_id
+          FROM track t3
+          INNER JOIN invoice_line il3 ON t3.track_id = il3.track_id
+          WHERE il3.invoice_id = il.invoice_id
+          
+          )
+          
+          IS NULL
+          
+          AND
+          
+          (
+          SELECT
+            t3.track_id
+          FROM track t3
+          INNER JOIN invoice_line il3 ON t3.track_id = il3.track_id
+          WHERE il3.invoice_id = il.invoice_id
+          
+          EXCEPT
+          
+          SELECT
+            t.track_id
+          FROM track t
+          WHERE album_id = ( 
+                            SELECT
+                              t2.album_id
+                            FROM track t2
+                            INNER JOIN invoice_line il2 ON t2.track_id = il2.track_id
+                            WHERE il2.invoice_id = il.invoice_id
+                            LIMIT 1
+                            )
+          )
+          IS NULL
+          
+         ) THEN 'album'
+       ELSE 'single_track'
+     END AS type_of_purchase
+   FROM invoice_line il
+  )
+
+SELECT
+  type_of_purchase,
+  COUNT(invoice_id) number_of_purchases,
+  (CAST(COUNT(invoice_id) AS FLOAT) /
+    (SELECT COUNT(DISTINCT(invoice_id)) FROM invoice)
+  ) * 100 percentage
+FROM album_or_single
+GROUP BY type_of_purchase
+"
+album_or_not <- run_query(q)
+
+```
+```{r}
+kable(album_or_not)
+```
+
+Although individual track sales account for around 81.43% of the total, we still have around 18.56% of whole album sales, which leads us to conclude that it's not a good idea to stop offering full albums, since that could imply an important loss in revenue. 
+
